@@ -60,7 +60,11 @@ class XianyuLive:
             
             # 获取新token（如果Cookie失效，get_token会直接退出程序）
             token_result = self.xianyu.get_token(self.device_id)
-            if 'data' in token_result and 'accessToken' in token_result['data']:
+            if not token_result or not isinstance(token_result, dict):
+                logger.error(f"Token刷新失败(get_token返回空/非dict): {token_result}")
+                return None
+            
+            if 'data' in token_result and isinstance(token_result.get('data'), dict) and 'accessToken' in token_result['data']:
                 new_token = token_result['data']['accessToken']
                 self.current_token = new_token
                 self.last_token_refresh_time = time.time()

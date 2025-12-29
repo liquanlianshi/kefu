@@ -138,68 +138,142 @@ class XianyuApis:
             return self.hasLogin(retry_count + 1)
 
     def get_token(self, device_id, retry_count=0):
-        if retry_count >= 2:  # 最多重试3次
-            logger.warning("获取token失败，尝试重新登陆")
-            # 尝试通过hasLogin重新登录
-            if self.hasLogin():
-                logger.info("重新登录成功，重新尝试获取token")
-                return self.get_token(device_id, 0)  # 重置重试次数
-            else:
-                logger.error("重新登录失败，Cookie已失效")
-                logger.error("🔴 程序即将退出，请更新.env文件中的COOKIES_STR后重新启动")
-                sys.exit(1)  # 直接退出程序
-            
-        params = {
-            'jsv': '2.7.2',
-            'appKey': '34839810',
-            't': str(int(time.time()) * 1000),
-            'sign': '',
-            'v': '1.0',
-            'type': 'originaljson',
-            'accountSite': 'xianyu',
-            'dataType': 'json',
-            'timeout': '20000',
-            'api': 'mtop.taobao.idlemessage.pc.login.token',
-            'sessionOption': 'AutoLoginOnly',
-            'spm_cnt': 'a21ybx.im.0.0',
-        }
-        data_val = '{"appKey":"444e9908a51d1cb236a27862abc769c9","deviceId":"' + device_id + '"}'
-        data = {
-            'data': data_val,
-        }
+        """
+        获取token（增加最大重试次数与风控退避，避免递归死循环）
         
-        # 简单获取token，信任cookies已清理干净
-        token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
+        Args:
+            device_id: 设备ID
+            retry_count: 起始重试次数（内部会继续累加）
+        """
+        # 最大重试次数（允许 0..max_retries 共 max_retries+1 次尝试）
+        try:
+            max_retries = int(os.getenv("TOKEN_MAX_RETRIES", "3"))
+        except Exception:
+            max_retries = 3
+        max_retries = max(0, max_retries)
         
-        sign = generate_sign(params['t'], token, data_val)
-        params['sign'] = sign
+        # 失败到一定次数后尝试重新登录（避免每次都触发 hasLogin 导致无限循环）
+        try:
+            relogin_after = int(os.getenv("TOKEN_RELOGIN_AFTER", "2"))
+        except Exception:
+            relogin_after = 2
+        relogin_after = max(0, relogin_after)
         
         try:
-            response = self.session.post('https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/', params=params, data=data)
-            res_json = response.json()
+            max_relogin = int(os.getenv("TOKEN_MAX_RELOGIN", "1"))
+        except Exception:
+            max_relogin = 1
+        max_relogin = max(0, max_relogin)
+        
+        relogin_count = 0
+        attempt = max(0, int(retry_count or 0))
+        
+        while attempt <= max_retries:
+            params = {
+                'jsv': '2.7.2',
+                'appKey': '34839810',
+                't': str(int(time.time()) * 1000),
+                'sign': '',
+                'v': '1.0',
+                'type': 'originaljson',
+                'accountSite': 'xianyu',
+                'dataType': 'json',
+                'timeout': '20000',
+                'api': 'mtop.taobao.idlemessage.pc.login.token',
+                'sessionOption': 'AutoLoginOnly',
+                'spm_cnt': 'a21ybx.im.0.0',
+            }
+            data_val = '{"appKey":"444e9908a51d1cb236a27862abc769c9","deviceId":"' + device_id + '"}'
+            data = {
+                'data': data_val,
+            }
             
-            if isinstance(res_json, dict):
+            # 简单获取token，信任cookies已清理干净
+            token = self.session.cookies.get('_m_h5_tk', '').split('_')[0]
+            if not token:
+                logger.warning("Cookie中缺少 _m_h5_tk，可能未登录或Cookie已失效")
+            
+            sign = generate_sign(params['t'], token, data_val)
+            params['sign'] = sign
+            
+            try:
+                response = self.session.post(
+                    'https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/',
+                    params=params,
+                    data=data,
+                )
+                
+                response_text = response.text or ""
+                # 风控：RGV587_ERROR（按阶梯式退避等待后再试）
+                if "RGV587_ERROR" in response_text:
+                    wait_seconds = attempt * 5 + 5
+                    logger.warning(f"触发风控(RGV587_ERROR)，等待 {wait_seconds} 秒后重试... (attempt={attempt}/{max_retries})")
+                    time.sleep(wait_seconds)
+                    attempt += 1
+                    continue
+                
+                try:
+                    res_json = response.json()
+                except Exception as e:
+                    logger.error(f"Token API响应非JSON: {str(e)}")
+                    time.sleep(0.5)
+                    attempt += 1
+                    continue
+                
+                if not isinstance(res_json, dict):
+                    logger.error(f"Token API返回格式异常: {res_json}")
+                    time.sleep(0.5)
+                    attempt += 1
+                    continue
+                
                 ret_value = res_json.get('ret', [])
+                
                 # 检查ret是否包含成功信息
-                if not any('SUCCESS::调用成功' in ret for ret in ret_value):
+                if not any('SUCCESS::调用成功' in str(ret) for ret in ret_value):
                     logger.warning(f"Token API调用失败，错误信息: {ret_value}")
+                    
                     # 处理响应中的Set-Cookie
                     if 'Set-Cookie' in response.headers:
                         logger.debug("检测到Set-Cookie，更新cookie")  # 降级为DEBUG并简化
                         self.clear_duplicate_cookies()
+                    
+                    # ret中也可能带风控标识
+                    if any('RGV587_ERROR' in str(ret) for ret in ret_value):
+                        wait_seconds = attempt * 5 + 5
+                        logger.warning(f"触发风控(RGV587_ERROR)，等待 {wait_seconds} 秒后重试... (attempt={attempt}/{max_retries})")
+                        time.sleep(wait_seconds)
+                        attempt += 1
+                        continue
+                    
+                    # 失败到一定次数后尝试重新登录（仅有限次数）
+                    if attempt >= relogin_after and relogin_count < max_relogin:
+                        logger.warning("获取token失败，尝试重新登陆")
+                        if self.hasLogin():
+                            relogin_count += 1
+                            logger.info("重新登录成功，准备重试获取token")
+                            time.sleep(0.5)
+                            attempt += 1
+                            continue
+                        else:
+                            logger.error("重新登录失败，Cookie已失效")
+                            logger.error("🔴 程序即将退出，请更新.env文件中的COOKIES_STR后重新启动")
+                            sys.exit(1)
+                    
                     time.sleep(0.5)
-                    return self.get_token(device_id, retry_count + 1)
-                else:
-                    logger.info("Token获取成功")
-                    return res_json
-            else:
-                logger.error(f"Token API返回格式异常: {res_json}")
-                return self.get_token(device_id, retry_count + 1)
+                    attempt += 1
+                    continue
                 
-        except Exception as e:
-            logger.error(f"Token API请求异常: {str(e)}")
-            time.sleep(0.5)
-            return self.get_token(device_id, retry_count + 1)
+                logger.info("Token获取成功")
+                return res_json
+                
+            except Exception as e:
+                logger.error(f"Token API请求异常: {str(e)}")
+                time.sleep(0.5)
+                attempt += 1
+                continue
+        
+        logger.error("超过最大重试次数，请手动处理风控或更换IP")
+        return None
 
     def get_item_info(self, item_id, retry_count=0):
         """获取商品信息，自动处理token失效的情况"""
